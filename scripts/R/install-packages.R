@@ -55,5 +55,3 @@ renv::snapshot()
 #   macOS:   xcode-select --install
 #   Linux:   build-essential (plus zlib1g-dev)
 # Install the toolchain, then re-run PART 2.
-# 
-
