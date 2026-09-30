@@ -45,10 +45,8 @@ packageVersion("Biostrings")
 packageVersion("pwalign")
 BiocManager::version()
 
-# Record the exact versions in renv.lock. type = "all" saves every package in
-# the project library; the default only saves packages that renv finds used in
-# the project's scripts, and could leave Biostrings/pwalign out of the lockfile.
-renv::snapshot(type = "all")
+# Record the exact versions in renv.lock
+renv::snapshot()
 
 # Notes: these packages and their dependencies (S4Vectors, IRanges,
 # XVector, ...) contain compiled code. If no binary exists for your R
