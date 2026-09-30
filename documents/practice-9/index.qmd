@@ -1,0 +1,618 @@
+---
+title: "Identificación bacteriana a partir del gen rRNA 16S con EzBioCloud: alcances y límites de la identificación basada en similitud"
+subtitle: "Práctica de laboratorio computacional"
+lang: es
+# Autores (opcional): descomente y complete
+# authors:
+#   - name: Nombre Apellido
+#     affiliation: Facultad / Universidad
+bibliography: references.bib
+link-citations: true
+# El código se muestra pero no se ejecuta al renderizar: requiere los genomas
+# descargados y los envíos manuales a EzBioCloud. Cambie a "eval: true" para
+# ejecutarlo tras correr los scripts en orden.
+execute:
+  eval: false
+  echo: true
+---
+
+|  |  |
+|:---------------|:------------------------------------------------------|
+| **Asignatura** | Bioinformática (Licenciatura en Microbiología) |
+| **Duración** | Dos sesiones de 2 h (Parte A–C en la primera; D–F en la segunda) más trabajo extraclase |
+| **Modalidad** | Equipos de 2–3 estudiantes, cada uno con computadora e Internet |
+| **Producto** | Reporte escrito con tablas de resultados, cuestionario resuelto y conclusión argumentada |
+| **Profesor(a)** | Dra. Mónica Figueroa |
+| **Equipo / fecha** |  |
+
+## Métodos
+
+### Materiales
+
+- Computadora con navegador e Internet y cuenta en **EzBioCloud** (www.ezbiocloud.net), creada antes de la sesión.
+- Acceso a **NCBI** (FTP de ensamblados de RefSeq).
+- **R** con los paquetes *Biostrings* y *pwalign* (Bioconductor). *pwalign* aporta las funciones de alineamiento pareado, que en las versiones recientes de Bioconductor se separaron de *Biostrings*.
+
+Los paquetes se instalaron dentro de un proyecto **renv** configurado para Bioconductor, de modo que las versiones exactas quedaron registradas en el archivo `renv.lock` y el análisis puede reproducirse en otra computadora con `renv::restore()`. La instalación se hizo en dos partes porque `renv::init()` reinicia la sesión de R.
+
+```{r}
+#| label: instalacion-renv
+
+# ---- Parte 1: crear el proyecto renv (se ejecuta una sola vez) --------------
+
+# Se instala renv (fuera de la biblioteca del proyecto)
+if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv")
+
+# bioconductor = TRUE fija el proyecto a la versión de Bioconductor que
+# corresponde a la versión de R instalada. La sesión de R se reinicia tras
+# esta línea.
+renv::init(bioconductor = TRUE)
+
+# ---- Parte 2: instalar y verificar los paquetes (tras el reinicio) ----------
+
+# Se comprueba que el proyecto renv esté activo en la sesión
+if (is.null(renv::project())) {
+  stop("No hay un proyecto renv activo. Use setwd() en la carpeta del proyecto y reinicie R.")
+}
+
+# El prefijo "bioc::" indica a renv que descargue los paquetes de Bioconductor.
+#   Biostrings: lectura y escritura de secuencias (Partes A, C, D y E)
+#   pwalign:    alineamiento pareado (Parte C)
+renv::install(c("bioc::Biostrings", "bioc::pwalign"))
+
+# Se verifica que ambos paquetes quedaron instalados; si no, se detiene el
+# script con un mensaje claro (la causa más común es la falta de un compilador)
+for (pkg in c("Biostrings", "pwalign")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("No se instaló ", pkg, ". Revise los mensajes de error de renv::install().")
+  }
+}
+
+# Versiones utilizadas
+library(Biostrings)
+packageVersion("Biostrings")
+packageVersion("pwalign")
+BiocManager::version()
+
+# Se registran las versiones exactas en renv.lock. type = "all" guarda todos
+# los paquetes de la biblioteca del proyecto; por defecto sólo se guardan los
+# que renv detecta en los scripts, y Biostrings o pwalign podrían quedar fuera
+# del archivo.
+renv::snapshot(type = "all")
+```
+
+### Conjunto de datos
+
+Se trabajó con genomas completos de cepas de referencia bien conocidas. Trabajar desde el genoma permite saber *a priori* qué organismo es cada muestra (lo que convierte a la práctica en un experimento controlado) y extraer todas las copias del gen 16S.
+
+| **Caso** | **Organismo (cepa)** | **Ensamblado RefSeq** | **Qué se pretende mostrar** |
+|:------------|:------------|:------------|:---------------------------------|
+| A | *Pseudomonas aeruginosa* PAO1 | GCF_000006765.1 | Caso de referencia para practicar el flujo e interpretar un informe |
+| B | *Escherichia coli* K-12 MG1655 | GCF_000005845.2 | Ambigüedad *Escherichia*–*Shigella*; heterogeneidad intragenómica (7 copias *rrn*) |
+| C | *Bacillus anthracis* Ames | GCF_000007845.1 | Grupo *B. cereus*: especies de relevancia clínica muy distinta con 16S casi idéntico |
+| D | *Streptococcus pneumoniae* TIGR4 | GCF_000006885.1 | Grupo *S. mitis*: patógeno frente a comensales orales |
+| E | Derivados del caso B o C | — | Efecto de la longitud y la región (gen completo, V1–V3, V4) |
+| F | Derivados del caso A | — | Efecto de los errores de secuenciación (0.5 %, 1 %, 2 %, 3 %) |
+
+Los casos E y F no corresponden a genomas distintos: son secuencias derivadas *in silico* de los casos anteriores (E, del caso B, aunque el código admite también el caso C; F, del caso A), según se describe en las Partes D y E.
+
+### Procedimiento
+
+El procedimiento se organizó en cinco partes (A–E). Todo el código se ejecutó dentro del proyecto renv y las rutas son relativas a la carpeta del proyecto, de modo que no dependen de la computadora ni del usuario. Los archivos descargados se guardaron en `raw-data/practice-8`, y las secuencias que se sometieron manualmente a EzBioCloud, en las carpetas `results/practice-8/EzBioCloud-1` a `EzBioCloud-4` (una por parte del procedimiento), con una secuencia por archivo.
+
+#### Parte A. Obtención de las secuencias del gen 16S
+
+Los ensamblados de la tabla se localizaron en el FTP de RefSeq de NCBI a partir de su número de acceso. Para cada uno se descargaron dos archivos: `*_rna_from_genomic.fna.gz`, que contiene los genes de RNA anotados, incluidos los rRNA, y `*_genomic.fna.gz`, con la secuencia completa del genoma (este último no se utilizó en los análisis descritos aquí). El nombre completo de la carpeta de cada ensamblado (p. ej., `GCF_000005845.2_ASM584v2`) se obtuvo del listado del directorio de NCBI en lugar de escribirse a mano, y los archivos ya descargados no se volvieron a bajar.
+
+De cada archivo de RNA se conservaron únicamente los registros cuyo encabezado contiene «16S ribosomal RNA», es decir, todas las copias del gen presentes en el genoma. Se registró el número de copias del 16S de cada genoma y la longitud de cada una, y la primera copia de cada caso (A–D) se guardó en formato FASTA (p. ej., `B_Ecoli_16S_copia1.fasta`) para someterla a EzBioCloud.
+
+El código completo de esta parte (descarga y extracción) corresponde al script `02_download_and_extract_16S.R` y se presenta a continuación.
+
+```{r}
+#| label: descarga-y-extraccion-16S
+
+# 02_download_and_extract_16S.R
+# ==============================================================================
+# Descarga los ensamblados RefSeq de los casos A-D desde el FTP de NCBI a
+#   <carpeta del proyecto>/raw-data/practice-8
+# y extrae las copias del gen 16S. Los casos E y F son derivados (simulados)
+# de B o C y de A, por lo que no tienen un ensamblado que descargar.
+# La primera copia del 16S de cada genoma (casos A-D) se guarda en
+# results/practice-8/EzBioCloud-1, lista para el envío manual a EzBioCloud.
+#
+# Portátil: no usa rutas absolutas. La carpeta del proyecto es el proyecto
+# renv (p. ej. .../bioinformatics-class), esté donde esté en cada computadora.
+# Abra esa carpeta como proyecto de R o directorio de trabajo antes de ejecutar.
+# ==============================================================================
+
+library(Biostrings)   # lectura y escritura de secuencias (DNAStringSet, FASTA)
+
+# El límite por defecto (60 s) puede ser insuficiente con conexiones lentas
+options(timeout = 600)
+
+# ---- Rutas (relativas a la carpeta del proyecto) -----------------------------
+
+# Carpeta del proyecto: el proyecto renv activo; si no hay ninguno, el
+# directorio de trabajo. Todas las demás rutas se construyen a partir de ella.
+raiz <- if (requireNamespace("renv", quietly = TRUE) && !is.null(renv::project())) {
+  renv::project()
+} else {
+  getwd()
+}
+
+# Carpeta de entrada para los genomas descargados; se crea si no existe
+dir_datos <- file.path(raiz, "raw-data", "practice-8")
+dir.create(dir_datos, recursive = TRUE, showWarnings = FALSE)
+message("Carpeta de datos: ", normalizePath(dir_datos))
+
+# ---- Genomas -----------------------------------------------------------------
+
+# Casos A-D: organismo, acceso del ensamblado RefSeq y nombre corto (este
+# último sólo se usa para nombrar los archivos FASTA)
+genomas <- data.frame(
+  caso      = c("A", "B", "C", "D"),
+  organismo = c("Pseudomonas aeruginosa PAO1",
+                "Escherichia coli K-12 MG1655",
+                "Bacillus anthracis Ames",
+                "Streptococcus pneumoniae TIGR4"),
+  acc       = c("GCF_000006765.1", "GCF_000005845.2",
+                "GCF_000007845.1", "GCF_000006885.1"),
+  nombre    = c("Paeruginosa", "Ecoli", "Banthracis", "Spneumoniae"),
+  stringsAsFactors = FALSE
+)
+
+base_ftp <- "https://ftp.ncbi.nlm.nih.gov/genomes/all"
+
+# Construye la ruta del FTP a partir del acceso, dividiendo sus 9 dígitos en
+# tres bloques: GCF_000005845.2 -> .../genomes/all/GCF/000/005/845
+ruta_acc <- function(acc) {
+  num    <- sub("^GCF_([0-9]+)\\.[0-9]+$", "\\1", acc)   # sólo los dígitos
+  partes <- substring(num, c(1, 4, 7), c(3, 6, 9))        # tres bloques de 3
+  paste(c(base_ftp, "GCF", partes), collapse = "/")
+}
+
+# Busca en el listado del directorio el nombre completo de la carpeta del
+# ensamblado (p. ej., GCF_000005845.2_ASM584v2)
+nombre_assembly <- function(acc) {
+  html <- readLines(paste0(ruta_acc(acc), "/"), warn = FALSE)
+  # el punto del acceso se escapa para que no se interprete como comodín
+  patron <- paste0(gsub(".", "\\.", acc, fixed = TRUE), "_[^/\"<]+")
+  hits <- regmatches(html, regexpr(patron, html))
+  if (length(hits) == 0) stop("No se encontró la carpeta del ensamblado ", acc)
+  unique(hits)[1]
+}
+
+# ---- Descarga ----------------------------------------------------------------
+
+# Para cada caso se descargan los dos archivos de interés:
+#   rna_from_genomic = secuencias de rRNA, tRNA y otros RNA (contiene el 16S)
+#   genomic          = secuencia completa del genoma
+for (i in seq_len(nrow(genomas))) {
+  acc <- genomas$acc[i]
+  asm <- nombre_assembly(acc)
+  message("Caso ", genomas$caso[i], ": ", genomas$organismo[i], " (", asm, ")")
+
+  for (sufijo in c("rna_from_genomic.fna.gz", "genomic.fna.gz")) {
+    archivo <- paste0(asm, "_", sufijo)
+    destino <- file.path(dir_datos, archivo)
+    if (!file.exists(destino)) {   # no se vuelve a descargar lo que ya existe
+      download.file(paste(ruta_acc(acc), asm, archivo, sep = "/"),
+                    destino, mode = "wb")
+    }
+  }
+}
+
+list.files(dir_datos)
+
+# ---- Extracción del 16S ------------------------------------------------------
+
+# Lee un archivo FASTA de RNA de RefSeq y conserva sólo los registros del 16S.
+# El encabezado de cada copia contiene "product=16S ribosomal RNA".
+extraer_16S <- function(archivo) {
+  rna <- readDNAStringSet(archivo)
+  rna[grepl("16S ribosomal RNA", names(rna))]
+}
+
+# Copias del 16S de E. coli (caso B)
+ecoli <- extraer_16S(file.path(dir_datos,
+                               "GCF_000005845.2_ASM584v2_rna_from_genomic.fna.gz"))
+length(ecoli)   # número de copias del 16S en el genoma
+width(ecoli)    # longitud de cada copia
+
+# Los archivos que se someterán a EzBioCloud van en results/, no en raw-data,
+# que sólo debe contener los archivos descargados
+dir_salida <- file.path(raiz, "results", "practice-8", "EzBioCloud-1")
+dir.create(dir_salida, recursive = TRUE, showWarnings = FALSE)
+
+# Para cada caso (A-D): se informa el número y la longitud de las copias del
+# 16S y se guarda la primera copia como un archivo FASTA independiente (una
+# secuencia por archivo) para enviarla a EzBioCloud, p. ej.
+# B_Ecoli_16S_copia1.fasta
+for (i in seq_len(nrow(genomas))) {
+  f <- list.files(dir_datos,
+                  pattern = paste0("^", genomas$acc[i], ".*rna_from_genomic"),
+                  full.names = TRUE)
+  x <- extraer_16S(f)
+  message("Caso ", genomas$caso[i], ": ", length(x), " copias, longitudes ",
+          paste(unique(width(x)), collapse = ", "))
+
+  archivo <- paste0(genomas$caso[i], "_", genomas$nombre[i], "_16S_copia1.fasta")
+  writeXStringSet(x[1], file.path(dir_salida, archivo))
+}
+```
+
+#### Parte B. Identificación con EzBioCloud
+
+Cada secuencia se sometió, de una en una, al servicio de identificación por 16S de EzBioCloud (*16S-based ID*) [@yoon2017; @chalita2024], que compara la secuencia problema contra las cepas tipo mediante alineamientos pareados globales y reporta, para cada candidato, el porcentaje de similitud y la completitud (fracción del gen cubierta por el alineamiento). En cada envío se eligió la opción para identificar una sola secuencia, se cargó el archivo FASTA (o se pegó la secuencia) con un nombre descriptivo y, al terminar el análisis, se abrió el informe.
+
+De cada informe se registraron el *top hit* (especie y cepa tipo), su porcentaje de similitud, la completitud y la lista completa de candidatos, considerando al menos los cinco primeros *hits*. Se contó cuántas especies distintas superaban 98.7 % de similitud y se calculó la diferencia (Δ) entre el primer y el segundo candidato, que se comparó con la que podría explicar un solo error de secuenciación (≈0.07 % en 1,500 pb). Los resultados de los casos A, B, C y D con el gen completo se registraron en la Tabla 1.
+
+Para interpretar la similitud se aplicaron los umbrales convencionales: 98.7 % para la delimitación de especies [@kim2014] y 94.5 % para la de géneros [@yarza2014]. Se tuvo presente que una similitud menor que 98.7 % es evidencia relativamente fuerte de especies distintas, pero una mayor no demuestra que se trate de la misma especie.
+
+#### Parte C. Heterogeneidad intragenómica
+
+Se compararon entre sí todas las copias del 16S de *E. coli* (caso B) y, además, las de *B. anthracis* (caso C). Cada par de copias se alineó de forma global con `pwalign::pairwiseAlignment()` (`type = "global"`, parámetros por defecto) y se calculó su porcentaje de identidad con `pwalign::pid()` (`type = "PID1"`: posiciones idénticas entre posiciones alineadas más posiciones de huecos internos, por 100, de modo que los huecos también cuentan como diferencias). Con estos valores se construyó una matriz simétrica de *n* × *n* copias, cuya diagonal vale 100 porque cada copia se compara consigo misma.
+
+El valor mínimo fuera de la diagonal se tomó como la mayor divergencia entre copias del mismo genoma, y las dos copias correspondientes (las «más divergentes») se guardaron cada una en su propio archivo FASTA en `EzBioCloud-2`. Si varios pares empataban en el mínimo, se usó el primero. Ambas copias se sometieron a EzBioCloud, y se comparó si cambiaba el *top hit* o el orden de los candidatos, así como si la divergencia entre copias era comparable con la diferencia entre especies observada en la Tabla 1.
+
+```{r}
+#| label: heterogeneidad-intragenomica
+
+# Se comprueba que pwalign esté instalado en el proyecto renv
+if (!requireNamespace("pwalign", quietly = TRUE)) {
+  stop("Falta el paquete 'pwalign'. Ejecute: renv::install(\"bioc::pwalign\"); renv::snapshot()")
+}
+
+# Carpeta de salida de esta parte (se crea junto con results/ y practice-8/
+# si no existen)
+dir_salida <- file.path(raiz, "results", "practice-8", "EzBioCloud-2")
+dir.create(dir_salida, recursive = TRUE, showWarnings = FALSE)
+
+# Localiza el archivo rna_from_genomic de un acceso (p. ej. "GCF_000005845.2")
+# dentro de raw-data/practice-8, sea cual sea el nombre del ensamblado
+archivo_rna <- function(acc) {
+  f <- list.files(dir_datos,
+                  pattern = paste0("^", acc, ".*rna_from_genomic\\.fna\\.gz$"),
+                  full.names = TRUE)
+  if (length(f) != 1) {
+    stop("Se esperaba un archivo rna_from_genomic para ", acc, " en ", dir_datos,
+         ". Ejecute primero la Parte A.")
+  }
+  f
+}
+
+# Construye una matriz de n x n con el % de identidad entre todos los pares de
+# copias.
+#  - type = "global": se alinea toda la longitud de ambas secuencias.
+#  - PID1: identidad = posiciones idénticas / (posiciones alineadas + posiciones
+#    de huecos internos) x 100; los huecos también cuentan como diferencias.
+#  - La diagonal vale 100 (cada copia comparada consigo misma).
+# Filas y columnas se llaman c1..cn, según el orden de las secuencias.
+matriz_pid <- function(secs) {
+  n <- length(secs)
+  etiquetas <- paste0("c", seq_len(n))
+  M <- matrix(NA_real_, n, n, dimnames = list(etiquetas, etiquetas))
+  for (i in seq_len(n)) for (j in seq_len(n)) {
+    aln <- pwalign::pairwiseAlignment(secs[[i]], secs[[j]], type = "global")
+    M[i, j] <- pwalign::pid(aln, type = "PID1")
+  }
+  M
+}
+
+# Encuentra el par de copias con la identidad MÁS BAJA de la matriz M.
+#  - La matriz es simétrica: se anulan (NA) la diagonal y el triángulo inferior
+#    para ver cada par una sola vez e ignorar las autocomparaciones.
+#  - Si varios pares empatan en el mínimo se usa el primero (índices más bajos);
+#    n_empates indica cuántos pares comparten ese valor.
+copias_mas_divergentes <- function(M) {
+  if (nrow(M) < 2) stop("Se necesitan al menos dos copias para compararlas.")
+  M_sup <- M
+  M_sup[lower.tri(M_sup, diag = TRUE)] <- NA
+  minimo <- min(M_sup, na.rm = TRUE)
+  pares <- which(M_sup == minimo, arr.ind = TRUE)
+  pares <- pares[order(pares[, "row"], pares[, "col"]), , drop = FALSE]
+  list(i = unname(pares[1, "row"]),
+       j = unname(pares[1, "col"]),
+       pid = minimo,
+       n_empates = nrow(pares))
+}
+
+# Informa el par más divergente y guarda cada una de las dos copias en su
+# propio archivo FASTA (una secuencia por archivo, como requiere el envío
+# manual a EzBioCloud): <prefijo>_16S_c<k>.fasta, donde k es el número de copia
+# de la matriz. Se conserva el encabezado original, que identifica la copia
+# en el genoma (locus tag).
+guardar_pareja_divergente <- function(secs, M, prefijo) {
+  p <- copias_mas_divergentes(M)
+
+  message("Par más divergente: c", p$i, " vs c", p$j,
+          " (", round(p$pid, 2), " % de identidad)")
+  if (p$n_empates > 1) {
+    message("  Nota: ", p$n_empates, " pares comparten este valor; se usa el primero.")
+  }
+  if (p$pid == 100) {
+    warning("Todas las copias son idénticas: el par «más divergente» es arbitrario.")
+  }
+  message("  c", p$i, ": ", names(secs)[p$i], " (", width(secs)[p$i], " pb)")
+  message("  c", p$j, ": ", names(secs)[p$j], " (", width(secs)[p$j], " pb)")
+
+  for (k in c(p$i, p$j)) {
+    archivo <- file.path(dir_salida, paste0(prefijo, "_16S_c", k, ".fasta"))
+    writeXStringSet(secs[k], archivo)
+    message("  Guardado: ", archivo)
+  }
+  invisible(p)
+}
+
+# ---- Caso B: E. coli K-12 MG1655 ---------------------------------------------
+
+# Copias del 16S de E. coli (se esperan 7)
+ecoli <- extraer_16S(archivo_rna("GCF_000005845.2"))
+length(ecoli)
+
+# Matriz de identidad de todas contra todas (en %, redondeada para mostrarla)
+M_ecoli <- matriz_pid(ecoli)
+round(M_ecoli, 2)
+
+# Menor identidad entre dos copias del mismo genoma, es decir, la mayor
+# divergencia dentro de E. coli
+min(M_ecoli)
+
+# Se identifican las dos copias más divergentes y se guardan para EzBioCloud
+guardar_pareja_divergente(ecoli, M_ecoli, prefijo = "B_Ecoli")
+
+# ---- Caso C (si el tiempo lo permite): B. anthracis Ames ---------------------
+
+# Mismo análisis para B. anthracis
+anthracis <- extraer_16S(archivo_rna("GCF_000007845.1"))
+length(anthracis)   # número de copias del 16S en este genoma
+
+M_anthracis <- matriz_pid(anthracis)
+round(M_anthracis, 2)
+min(M_anthracis)
+
+guardar_pareja_divergente(anthracis, M_anthracis, prefijo = "C_Banthracis")
+```
+
+#### Parte D. Efecto de la longitud y de la región variable
+
+A partir de la primera copia del 16S del caso B se generaron *in silico* los fragmentos que se obtendrían con dos pares de iniciadores comunes: 27F/534R (región V1–V3) y 515F/806R (región V4). Se trabajó con una sola copia para que la fila «Gen completo» de la Tabla 2 y ambos fragmentos provinieran de la misma secuencia; el código permite usar el caso C cambiando la variable `caso`.
+
+La PCR se simuló buscando el iniciador directo tal como está escrito y el iniciador reverso mediante su complemento reverso, ya que este último hibrida con la hebra opuesta. Los códigos de ambigüedad IUPAC de los iniciadores (M = A/C, Y = C/T, N = cualquier base, V = A/C/G, W = A/T) se trataron como coincidencias (`fixed = FALSE`) y no se admitieron discrepancias adicionales (`max.mismatch = 0`). Sólo se aceptaron sitios del iniciador reverso posteriores al primer sitio del iniciador directo. El amplicón se definió desde la base siguiente al iniciador directo hasta la anterior al sitio del iniciador reverso, es decir, sin los iniciadores.
+
+Se registró la longitud de la secuencia completa y de cada fragmento. La secuencia completa y los dos fragmentos se guardaron en archivos FASTA separados (`EzBioCloud-3`) y se sometieron por separado a EzBioCloud. En la Tabla 2 se registraron, para cada uno, la longitud, el *top hit*, el porcentaje de similitud, la completitud, el número de especies por encima de 98.7 % y si la identificación fue correcta, y se anotó si el servicio emitía advertencias sobre la longitud.
+
+```{r}
+#| label: longitud-y-region
+
+# ---- Configuración -----------------------------------------------------------
+
+# Genoma que se usa: "B" (E. coli K-12 MG1655) o "C" (B. anthracis Ames)
+caso <- "B"
+
+casos <- list(
+  B = list(acc = "GCF_000005845.2", nombre = "Ecoli"),
+  C = list(acc = "GCF_000007845.1", nombre = "Banthracis")
+)
+genoma <- casos[[caso]]
+
+# Pares de iniciadores, escritos 5'->3' como se publican habitualmente. Las
+# letras M, Y, N, V y W son códigos de ambigüedad IUPAC.
+cebadores <- list(
+  V1V3 = list(fwd = "AGAGTTTGATCMTGGCTCAG", rev = "ATTACCGCGGCTGCTGG"),    # 27F / 534R
+  V4   = list(fwd = "GTGYCAGCMGCCGCGGTAA",  rev = "GGACTACNVGGGTWTCTAAT")  # 515F / 806R
+)
+
+# Carpeta de salida de esta parte
+dir_salida <- file.path(raiz, "results", "practice-8", "EzBioCloud-3")
+dir.create(dir_salida, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Simulación de la PCR ----------------------------------------------------
+
+# Simula una PCR sobre la secuencia s y devuelve el amplicón SIN los iniciadores.
+#  - fwd: iniciador directo; coincide con la secuencia tal como está escrito.
+#  - rev: iniciador reverso; hibrida con la hebra opuesta, así que en s se
+#    busca su complemento reverso.
+#  - fixed = FALSE permite que los códigos IUPAC de los iniciadores coincidan.
+#  - mm: discrepancias permitidas (0 = coincidencia exacta salvo los códigos
+#    de ambigüedad). Puede aumentarse si un iniciador "no se encuentra" en un
+#    genoma divergente.
+recortar <- function(s, fwd, rev, mm = 0) {
+  f <- matchPattern(DNAString(fwd), s, max.mismatch = mm, fixed = FALSE)
+  r <- matchPattern(reverseComplement(DNAString(rev)), s,
+                    max.mismatch = mm, fixed = FALSE)
+  if (length(f) == 0 || length(r) == 0) stop("No se encontró algún iniciador")
+
+  # Sólo tienen sentido los sitios del iniciador reverso posteriores al primer
+  # sitio del iniciador directo
+  n_sitios <- c(fwd = length(f), rev = length(r))
+  r <- r[start(r) > end(f)[1]]
+  if (length(r) == 0) stop("El iniciador reverso no se encontró después del directo")
+  if (any(n_sitios > 1)) {
+    warning("Un iniciador se une a más de un sitio; se usa el primero válido.")
+  }
+
+  message("  iniciador directo en ", start(f)[1], "-", end(f)[1],
+          "; sitio del reverso en ", start(r)[1], "-", end(r)[1])
+  subseq(s, start = end(f)[1] + 1, end = start(r)[1] - 1)   # sin iniciadores
+}
+
+# ---- Secuencia completa y fragmentos -----------------------------------------
+
+# Todas las copias del 16S del genoma elegido; se trabaja con la primera
+copias <- extraer_16S(archivo_rna(genoma$acc))
+s <- copias[[1]]
+message("Se usa la copia 1 del caso ", caso, " (", names(copias)[1], ")")
+
+# Un fragmento por región (V1V3 y V4)
+fragmentos <- lapply(names(cebadores), function(region) {
+  message("Región ", region, ":")
+  recortar(s, cebadores[[region]]$fwd, cebadores[[region]]$rev)
+})
+names(fragmentos) <- names(cebadores)
+
+# Longitudes (pb) para la columna «Long. (pb)» de la Tabla 2
+longitudes <- c(completo = length(s), sapply(fragmentos, length))
+longitudes
+
+# ---- Archivos FASTA para EzBioCloud ------------------------------------------
+
+# Una secuencia por archivo (EzBioCloud se usa de una en una):
+#   E_<organismo>_completo.fasta, E_<organismo>_V1V3.fasta, E_<organismo>_V4.fasta
+# "E" = secuencias derivadas del caso B o C (caso E de la práctica)
+completo <- DNAStringSet(list(completo = s))
+guardar <- function(secuencia, etiqueta) {
+  archivo <- file.path(dir_salida, paste0("E_", genoma$nombre, "_", etiqueta, ".fasta"))
+  writeXStringSet(secuencia, archivo)
+  message("Guardado: ", archivo)
+}
+
+guardar(completo, "completo")
+for (region in names(fragmentos)) {
+  guardar(DNAStringSet(setNames(list(fragmentos[[region]]), region)), region)
+}
+
+# Ambos fragmentos juntos en un solo multi-FASTA (opcional, sólo de referencia:
+# EzBioCloud requiere enviarlos por separado)
+frag <- DNAStringSet(fragmentos)
+writeXStringSet(frag, file.path(dir_salida, paste0("E_", genoma$nombre, "_fragmentos.fasta")))
+```
+
+#### Parte E. Efecto de los errores de secuenciación
+
+Se simularon lecturas de baja calidad introduciendo sustituciones al azar en la primera copia del 16S de *P. aeruginosa* PAO1 (caso A) con tasas de error de 0.5, 1, 2 y 3 %. Para cada tasa se eligieron, sin reemplazo, `round(longitud × tasa)` posiciones distintas de la secuencia, y la base de cada una se cambió por una de las otras tres, de modo que todo sorteo fue una sustitución real. Sólo se simularon sustituciones (no inserciones ni deleciones). Se fijó la semilla del generador de números aleatorios (`set.seed(2026)`) para que las mutaciones fueran reproducibles.
+
+Como verificación, se contó cuántas bases cambiaron en cada mutante y se calculó su identidad exacta con la secuencia original, `100 × (1 − sustituciones / longitud)`. Cada mutante se guardó en su propio archivo FASTA (`EzBioCloud-4`), se sometió a EzBioCloud y se registró la similitud con el *top hit*.
+
+Con esos valores se graficó la similitud frente a la tasa de error, con líneas horizontales en 98.7 % (umbral de especie) y 94.5 % (umbral de género), junto con la similitud esperada si el *top hit* fuera idéntico a la secuencia original (100 − tasa de error). Bajo ese supuesto, un aislado conocido cae por debajo de un umbral cuando la tasa de error supera 100 − umbral, lo que permite estimar a partir de qué tasa parecería una «especie nueva» o un «género nuevo».
+
+```{r}
+#| label: errores-de-secuenciacion
+
+# ---- Configuración -----------------------------------------------------------
+
+semilla <- 2026                           # semilla aleatoria: use el número de su equipo
+tasas   <- c(0.005, 0.01, 0.02, 0.03)     # tasas de error: 0.5, 1, 2 y 3 %
+
+# Similitud (%) con el top hit de EzBioCloud para cada mutante, en el mismo
+# orden que 'tasas'. Se deja NA hasta tener los resultados; luego se completa
+# y se vuelve a ejecutar desde la sección de la gráfica.
+sim_ezbiocloud <- c(NA, NA, NA, NA)
+
+umbral_especie <- 98.7   # % de similitud: umbral de especie
+umbral_genero  <- 94.5   # % de similitud: umbral de género
+
+# Carpeta de salida: archivos FASTA para EzBioCloud y la gráfica
+dir_res    <- file.path(raiz, "results", "practice-8")
+dir_salida <- file.path(dir_res, "EzBioCloud-4")
+dir.create(dir_salida, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Funciones ---------------------------------------------------------------
+
+# Introduce sustituciones al azar en la secuencia s con una tasa de error dada.
+#  - x: la secuencia como vector de letras.
+#  - pos: posiciones a mutar, sorteadas SIN reemplazo, de modo que cambian
+#    exactamente round(longitud * tasa) posiciones distintas.
+#  - Cada base elegida se sustituye por una de las otras tres (nunca por sí
+#    misma), así que todo sorteo es una sustitución real.
+# Sólo se simulan sustituciones (sin inserciones ni deleciones).
+mutar <- function(s, tasa) {
+  x <- strsplit(as.character(s), "")[[1]]
+  pos <- sample(length(x), round(length(x) * tasa))
+  for (p in pos) x[p] <- sample(setdiff(c("A", "C", "G", "T"), x[p]), 1)
+  DNAString(paste(x, collapse = ""))
+}
+
+# Número de posiciones en las que difieren dos secuencias de igual longitud
+n_diferencias <- function(a, b) {
+  sum(strsplit(as.character(a), "")[[1]] != strsplit(as.character(b), "")[[1]])
+}
+
+# ---- Secuencia original y mutantes -------------------------------------------
+
+# Con la semilla fija, las sustituciones aleatorias son reproducibles
+set.seed(semilla)
+
+# Primera copia del 16S de P. aeruginosa PAO1 (caso A)
+pae <- extraer_16S(archivo_rna("GCF_000006765.1"))[[1]]
+length(pae)
+
+# Un mutante por tasa de error, con nombres como "Pae_error_0.5pct"
+mut <- DNAStringSet(lapply(tasas, function(t) mutar(pae, t)))
+names(mut) <- paste0("Pae_error_", tasas * 100, "pct")
+
+# Verificación: cuántas bases cambiaron y la identidad exacta de cada mutante
+# con la secuencia original, 100 * (1 - sustituciones / longitud). La similitud
+# que reporte EzBioCloud debe ser cercana a este valor, porque el top hit es
+# casi idéntico a la secuencia original.
+sustituciones <- sapply(mut, function(m) n_diferencias(pae, m))
+tabla <- data.frame(
+  error_pct      = tasas * 100,
+  sustituciones  = sustituciones,
+  identidad_pct  = round(100 * (1 - sustituciones / length(pae)), 2),
+  sim_ezbiocloud = sim_ezbiocloud,
+  row.names      = names(mut)
+)
+tabla
+
+# ---- Archivos FASTA para EzBioCloud ------------------------------------------
+
+# Una secuencia por archivo (se envían de una en una), p. ej.
+# F_Pae_error_0_5pct.fasta; los puntos del nombre se sustituyen por "_"
+for (k in seq_along(mut)) {
+  archivo <- file.path(dir_salida,
+                       paste0("F_", gsub("\\.", "_", names(mut)[k]), ".fasta"))
+  writeXStringSet(mut[k], archivo)
+  message("Guardado: ", archivo)
+}
+
+# Todos los mutantes juntos (opcional, sólo de referencia)
+writeXStringSet(mut, file.path(dir_salida, "F_mutantes.fasta"))
+
+# ---- Gráfica: similitud frente a tasa de error -------------------------------
+
+# Se actualiza la tabla con los valores de EzBioCloud que haya en
+# 'sim_ezbiocloud' (edite ese vector y vuelva a ejecutar desde aquí)
+tabla$sim_ezbiocloud <- sim_ezbiocloud
+tabla
+
+# Línea gris = similitud esperada si el top hit fuera idéntico a la secuencia
+# original: similitud = 100 - tasa de error. Puntos = lo que reporta
+# EzBioCloud. Líneas horizontales discontinua y punteada = umbrales de especie
+# y de género.
+dibujar <- function() {
+  plot(NA, xlim = c(0, 6), ylim = c(93, 101.5),
+       xlab = "Tasa de error simulada (%)",
+       ylab = "Similitud con el top hit (%)",
+       main = "Efecto de los errores de secuenciación sobre la identificación (Pae PAO1)")
+  abline(a = 100, b = -1, col = "grey60")                      # similitud esperada
+  abline(h = umbral_especie, lty = 2, col = "red",  lwd = 2)   # especie
+  abline(h = umbral_genero,  lty = 3, col = "blue", lwd = 2)   # género
+  text(6, umbral_especie + 0.3, "98.7 % (especie)", adj = 1, col = "red")
+  text(6, umbral_genero  + 0.3, "94.5 % (género)",  adj = 1, col = "blue")
+  points(tabla$error_pct, tabla$identidad_pct, pch = 1, cex = 1.3, col = "grey40")
+  points(tabla$error_pct, tabla$sim_ezbiocloud, pch = 19, cex = 1.3)
+  legend("topright", bty = "n",
+         legend = c("Esperada (100 - error)", "Identidad exacta con el original",
+                    "Top hit de EzBioCloud"),
+         lty = c(1, NA, NA), pch = c(NA, 1, 19), col = c("grey60", "grey40", "black"))
+}
+
+dibujar()                                   # se muestra en la ventana de gráficos
+
+png(file.path(dir_salida, "F_similitud_vs_error.png"), width = 1800, height = 1200, res = 200)
+dibujar()                                   # se guarda la misma gráfica como PNG
+dev.off()
+
+# ---- Tasa de error a la que se cruzan los umbrales ---------------------------
+
+# Con similitud = 100 - tasa de error, un aislado conocido queda por debajo de
+# un umbral cuando la tasa de error supera 100 - umbral.
+100 - umbral_especie   # tasa (%) a partir de la cual parece una especie nueva
+100 - umbral_genero    # tasa (%) a partir de la cual parece un género nuevo
+```
+
+## Referencias
+
+::: {#refs}
+:::
